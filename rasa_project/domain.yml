@@ -1,35 +1,43 @@
-# Rasa domain — slots, responses, and actions the flows reference.
-# Intents are NOT listed here explicitly (CALM uses flows + the LLM
-# command generator; intent recognition is optional).
-
 version: "3.1"
+
+# ─────────────────────────────────────────────────────────────────────
+# Domain for the booking assistant.
+#
+# Slots are filled two ways:
+#   1. Programmatically, by action_validate_booking reading
+#      metadata.booking (the normal path — confirm_booking).
+#   2. Via collect steps, only in resume_from_loop when the loop half
+#      handed off an incomplete booking.
+#
+# `booking_date` and `booking_time` are named with a `booking_` prefix
+# rather than `date`/`time` so their collect steps map cleanly to
+# action_ask_booking_date / action_ask_booking_time without colliding
+# with any reserved names. action_validate_booking writes to these same
+# slot names.
+# ─────────────────────────────────────────────────────────────────────
 
 slots:
   venue_id:
     type: text
     mappings:
-      - type: from_llm
-  date:
+      - type: controlled
+  booking_date:
     type: text
     mappings:
-      - type: from_llm
-  time:
+      - type: controlled
+  booking_time:
     type: text
     mappings:
-      - type: from_llm
+      - type: controlled
   party_size:
     type: float
     mappings:
-      - type: from_llm
+      - type: controlled
   deposit_gbp:
     type: float
+    initial_value: 0
     mappings:
-      - type: from_llm
-  duration_hours:
-    type: float
-    initial_value: 3
-    mappings:
-      - type: from_llm
+      - type: controlled
   validation_error:
     type: text
     mappings:
@@ -44,11 +52,21 @@ responses:
     - text: "Booking confirmed. Reference: {booking_reference}."
   utter_booking_rejected:
     - text: "Sorry, we can't accept this booking. Reason: {validation_error}"
+  # Fallbacks for resume_from_loop's collect steps. These only fire if
+  # the loop half handed off an incomplete booking.
+  utter_ask_venue_id:
+    - text: "Which venue is this booking for?"
+  utter_ask_booking_date:
+    - text: "What date should I book? (YYYY-MM-DD)"
+  utter_ask_booking_time:
+    - text: "What time? (e.g. 19:30)"
+  utter_ask_party_size:
+    - text: "How many people are in the party?"
 
 actions:
   - action_validate_booking
+  - action_request_research
 
-# Sessions intentionally minimal — Ex6 doesn't need carryover.
 session_config:
   session_expiration_time: 60
-  carry_over_slots_to_new_session: false
+  carry_over_slots_to_new_session: true

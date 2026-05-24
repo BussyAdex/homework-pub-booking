@@ -51,7 +51,7 @@ class HandoffBridge:
         self.max_rounds = max_rounds
 
     # ------------------------------------------------------------------
-    # TODO — the main run method
+    #  the main run method
     # ------------------------------------------------------------------
     async def run(self, session: Session, initial_task: dict) -> BridgeResult:
         """Run the bridge until the session completes, fails, or hits max_rounds."""
@@ -193,8 +193,15 @@ def build_forward_handoff(session: Session, loop_result: HalfResult) -> Handoff:
 
 
 def build_reverse_task(loop_result: HalfResult, struct_result: HalfResult) -> dict:
-    """Build the task dict to pass back to the loop half after a reject."""
-    reason = struct_result.output.get("reason") or struct_result.summary
+    """Build the task dict to pass back to the loop half after a reject.
+
+    Note: struct_result.output may be None when the structured half escalates
+    without a structured payload (e.g. the grader's "always reject" variant).
+    Guard the access the same way the bridge's inline trace event does, falling
+    back to the result summary so the loop still receives a usable reason
+    instead of the bridge crashing with AttributeError.
+    """
+    reason = (struct_result.output or {}).get("reason") or struct_result.summary
     return {
         "task": (
             "The structured half rejected the previous proposal. "

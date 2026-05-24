@@ -1,4 +1,4 @@
-# homework-pub-booking
+up# homework-pub-booking
 
 **Build an AI agent that books a pub in Edinburgh.**
 

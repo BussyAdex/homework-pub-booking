@@ -1,6 +1,13 @@
 """Ex7 — reference solution runner. Scripts a two-round round-trip:
-round 1: loop picks haymarket_tap (8 seats), structured rejects (party=12 > cap=8)
-round 2: loop picks royal_oak (16 seats), structured accepts."""
+round 1: loop proposes party of 12 (haymarket_tap), structured rejects (12 > cap=8)
+round 2: loop scales the party down to 6 (royal_oak), structured accepts (6 <= cap=8).
+
+NOTE on the cap: the structured half enforces a FLAT party-size cap of 8
+(see Ex6 ActionValidateBooking). It does NOT validate party size against
+venue capacity. So what unblocks round 2 is the smaller party (6 <= 8), not
+royal_oak's 16 seats — the venue is narrative context only. The scripted
+'reason'/'context' strings below are written to reflect that truth rather
+than implying capacity resolved the rejection."""
 
 from __future__ import annotations
 
@@ -25,8 +32,8 @@ from starter.rasa_half.structured_half import RasaStructuredHalf, spawn_mock_ras
 
 
 def _build_fake_client_two_rounds() -> FakeLLMClient:
-    """Round 1: plan → venue_search → handoff_to_structured (haymarket_tap)
-    Round 2: plan → venue_search → handoff_to_structured (royal_oak)"""
+    """Round 1: plan → venue_search → handoff_to_structured (party 12, haymarket_tap)
+    Round 2: plan → venue_search → handoff_to_structured (party 6, royal_oak)"""
     plan_r1 = json.dumps(
         [
             {
@@ -39,13 +46,13 @@ def _build_fake_client_two_rounds() -> FakeLLMClient:
             }
         ]
     )
-    # round 2 — loop gets rejection reason, retries with different area
+    # round 2 — loop gets rejection reason, retries with a party that fits the cap
     plan_r2 = json.dumps(
         [
             {
                 "id": "sg_1",
-                "description": "retry with larger venue after rejection",
-                "success_criterion": "different venue with enough seats",
+                "description": "retry with a party size within the policy cap after rejection",
+                "success_criterion": "party size within cap at a suitable venue",
                 "estimated_tool_calls": 2,
                 "depends_on": [],
                 "assigned_half": "loop",
@@ -86,9 +93,9 @@ def _build_fake_client_two_rounds() -> FakeLLMClient:
                     )
                 ]
             ),
-            # === ROUND 2 (after reverse handoff from structured rejecting party=12) ===
+            # === ROUND 2 (after reverse handoff: structured rejected party=12 > cap=8) ===
             ScriptedResponse(content=plan_r2),  # planner turn 2
-            ScriptedResponse(  # executor turn 1: new search with smaller party
+            ScriptedResponse(  # executor turn 1: new search with a party within the cap
                 tool_calls=[
                     ToolCall(
                         id="c3",
@@ -97,14 +104,14 @@ def _build_fake_client_two_rounds() -> FakeLLMClient:
                     )
                 ]
             ),
-            ScriptedResponse(  # executor turn 2: handoff royal_oak with party=6
+            ScriptedResponse(  # executor turn 2: handoff royal_oak with party=6 (within cap)
                 tool_calls=[
                     ToolCall(
                         id="c4",
                         name="handoff_to_structured",
                         arguments={
-                            "reason": "retry after reverse handoff — scaled down to fit policy",
-                            "context": "party was originally 12; rejected; re-proposing party of 6 at royal_oak (16 seats)",
+                            "reason": "retry after reverse handoff — scaled party from 12 down to 6 to fit the policy cap of 8",
+                            "context": "party of 12 was rejected (cap is 8); re-proposing a party of 6 at royal_oak, now within the cap",
                             "data": {
                                 "action": "confirm_booking",
                                 "venue_id": "The Royal Oak",

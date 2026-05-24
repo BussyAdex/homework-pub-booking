@@ -57,7 +57,7 @@ async def probe() -> int:
     # Nebius in April 2026). Override with NEBIUS_SMOKE_MODEL env var if
     # this stops working; the probe's job is auth + network, not any
     # specific model being hosted.
-    model = os.environ.get("NEBIUS_SMOKE_MODEL", "google/gemma-2-2b-it")
+    model = os.environ.get("NEBIUS_SMOKE_MODEL", "nvidia/Llama-3_1-Nemotron-Ultra-253B-v1")
 
     try:
         from openai import AsyncOpenAI

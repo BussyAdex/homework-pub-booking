@@ -1,15 +1,17 @@
 """Ex6 — RasaStructuredHalf reference solution.
 
 Two paths:
-  1. Real Rasa Pro container (default when RASA_PRO_LICENSE is set).
-     Uses docker-compose to spawn rasa + action-server, waits for
-     health, POSTs to /webhooks/rest/webhook, tears down on exit.
-  2. Stdlib mock server (when RASA_PRO_LICENSE is empty or --mock
-     is passed). Lets students without a license progress through
-     HTTP-contract tests.
+  1. Real Rasa Pro server (default when RASA_PRO_LICENSE is set).
+     RasaHostLifecycle trains, spawns rasa + action-server, waits for
+     health, then this half POSTs to /webhooks/rest/webhook.
+  2. Stdlib mock server (when no license / --mock). Lets students
+     without a license validate normalise_booking_payload + HTTP wiring
+     before signing up for Rasa.
 
-The mock is intentionally kept — it's how students validate their
-normalise_booking_payload and HTTP wiring BEFORE signing up for Rasa.
+Response parsing is structured-payload-first: the custom action emits
+{"action": "committed" | "rejected" | "request_research", ...} and we
+branch on that. Free-text matching is kept only as a last-resort
+fallback so a reworded response template doesn't silently break grading.
 """
 
 from __future__ import annotations
@@ -35,6 +37,55 @@ from starter.rasa_half.validator import normalise_booking_payload
 
 RASA_REST_WEBHOOK_DEFAULT = "http://localhost:5005/webhooks/rest/webhook"
 _SOLUTION_EX6 = Path(__file__).resolve().parent
+
+
+def _classify_messages(messages: list) -> dict:
+    """Reduce Rasa's REST reply to a verdict.
+
+    Returns {"verdict": "committed"|"rejected"|"research"|"unknown",
+             "reason": str|None, "booking_reference": str|None}.
+    Structured `custom` payloads win; text is a fallback.
+    """
+    verdict = "unknown"
+    reason = None
+    booking_reference = None
+
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        custom = m.get("custom") if isinstance(m.get("custom"), dict) else {}
+        action = custom.get("action")
+        text = m.get("text") or ""
+        low = text.lower()
+
+        # ── structured signal (authoritative) ──
+        if action == "committed":
+            verdict = "committed"
+            booking_reference = custom.get("booking_reference") or booking_reference
+            continue
+        if action == "rejected":
+            verdict = "rejected"
+            reason = custom.get("reason") or reason or "rejected"
+            continue
+        if action == "request_research":
+            verdict = "research"
+            reason = custom.get("reason") or reason
+            continue
+
+        # ── text fallback (only if no structured verdict yet) ──
+        if verdict == "unknown":
+            if "booking confirmed" in low or "reference:" in low:
+                verdict = "committed"
+                if "reference:" in low and not booking_reference:
+                    # Split on the lowercased copy to stay case-insensitive,
+                    # then map the index back onto the original text.
+                    idx = low.index("reference:") + len("reference:")
+                    booking_reference = text[idx:].strip().rstrip(".").upper()
+            elif "can't accept" in low or "rejected" in low:
+                verdict = "rejected"
+                reason = reason or (text or "rejected by rasa")
+
+    return {"verdict": verdict, "reason": reason, "booking_reference": booking_reference}
 
 
 class RasaStructuredHalf(StructuredHalf):
@@ -68,7 +119,7 @@ class RasaStructuredHalf(StructuredHalf):
                     "output": {"success": True, "next_action": "complete"},
                 }
             ],
-            "version": "0.1.0",
+            "version": "0.2.0",
             "metadata": {"rasa_url": self.rasa_url},
         }
 
@@ -82,8 +133,10 @@ class RasaStructuredHalf(StructuredHalf):
                 next_action="escalate",
             )
 
+        # Pass through the requested flow if the caller specified one.
+        action = data.get("action", "confirm_booking")
         try:
-            rasa_msg = normalise_booking_payload(data)
+            rasa_msg = normalise_booking_payload(data, action=action)
         except Exception as e:  # noqa: BLE001
             return HalfResult(
                 success=False,
@@ -123,7 +176,22 @@ class RasaStructuredHalf(StructuredHalf):
                 summary=f"rasa returned HTTP {e.code}",
                 next_action="escalate",
             )
+        except TimeoutError:
+            return HalfResult(
+                success=False,
+                output={"error": "timeout", "error_code": "SA_EXT_TIMEOUT"},
+                summary="rasa request timed out",
+                next_action="escalate",
+            )
         except URLError as e:
+            # URLError can wrap a socket timeout; classify it as such.
+            if isinstance(getattr(e, "reason", None), TimeoutError):
+                return HalfResult(
+                    success=False,
+                    output={"error": "timeout", "error_code": "SA_EXT_TIMEOUT"},
+                    summary="rasa request timed out",
+                    next_action="escalate",
+                )
             return HalfResult(
                 success=False,
                 output={
@@ -134,71 +202,60 @@ class RasaStructuredHalf(StructuredHalf):
                 summary=f"rasa unreachable: {e}",
                 next_action="escalate",
             )
-        except TimeoutError:
-            return HalfResult(
-                success=False,
-                output={"error": "timeout", "error_code": "SA_EXT_TIMEOUT"},
-                summary="rasa request timed out",
-                next_action="escalate",
-            )
 
         try:
             messages = json.loads(raw_response)
-        except json.JSONDecodeError:
+            if not isinstance(messages, list):
+                raise ValueError("expected a JSON array of messages")
+        except (json.JSONDecodeError, ValueError):
             return HalfResult(
                 success=False,
                 output={
-                    "error": "rasa returned non-JSON",
+                    "error": "rasa returned non-JSON or unexpected shape",
                     "raw": raw_response[:200].decode("utf-8", errors="replace"),
                 },
-                summary="rasa response not JSON",
+                summary="rasa response not a JSON message list",
                 next_action="escalate",
             )
 
-        confirmed = False
-        rejected = False
-        rejection_reason = ""
-        booking_reference = None
-        for m in messages:
-            if not isinstance(m, dict):
-                continue
-            text = (m.get("text") or "").lower()
-            custom = m.get("custom") or {}
-            action = custom.get("action") if isinstance(custom, dict) else None
+        v = _classify_messages(messages)
 
-            if action == "committed" or "booking confirmed" in text:
-                confirmed = True
-                if isinstance(custom, dict):
-                    booking_reference = custom.get("booking_reference")
-                if "reference:" in text and not booking_reference:
-                    booking_reference = text.split("reference:", 1)[1].strip().rstrip(".").upper()
-            if action == "rejected" or "can't accept" in text or "rejected" in text:
-                rejected = True
-                rejection_reason = text or "rejected by rasa"
-
-        if confirmed and not rejected:
+        if v["verdict"] == "committed":
             return HalfResult(
                 success=True,
                 output={
                     "committed": True,
                     "booking": booking,
-                    "booking_reference": booking_reference,
+                    "booking_reference": v["booking_reference"],
                     "rasa_response": messages,
                 },
-                summary=f"booking confirmed by rasa (ref={booking_reference})",
+                summary=f"booking confirmed by rasa (ref={v['booking_reference']})",
                 next_action="complete",
             )
 
-        if rejected:
+        if v["verdict"] == "research":
+            return HalfResult(
+                success=False,
+                output={
+                    "research_requested": True,
+                    "reason": v["reason"],
+                    "rasa_response": messages,
+                    "booking": booking,
+                },
+                summary=f"rasa requested research: {v['reason']}",
+                next_action="research",
+            )
+
+        if v["verdict"] == "rejected":
             return HalfResult(
                 success=False,
                 output={
                     "rejected": True,
-                    "reason": rejection_reason,
+                    "reason": v["reason"],
                     "rasa_response": messages,
                     "booking": booking,
                 },
-                summary=f"rasa rejected: {rejection_reason}",
+                summary=f"rasa rejected: {v['reason']}",
                 next_action="escalate",
             )
 
@@ -206,7 +263,7 @@ class RasaStructuredHalf(StructuredHalf):
             success=False,
             output={
                 "rasa_response": messages,
-                "note": "neither confirmation nor rejection detected",
+                "note": "no committed/rejected/research signal detected",
             },
             summary="rasa returned unexpected output",
             next_action="escalate",
@@ -216,26 +273,13 @@ class RasaStructuredHalf(StructuredHalf):
 # ─────────────────────────────────────────────────────────────────────
 # Host-process Rasa orchestration (no Docker)
 # ─────────────────────────────────────────────────────────────────────
-
-
 class RasaHostLifecycle:
     """Spawn rasa-pro + action-server as host processes, wait for health,
     tear down. Uses the uv-managed venv's `rasa` CLI directly.
 
-    Usage:
-        async with RasaHostLifecycle(log_dir=Path(...)) as url:
-            half = RasaStructuredHalf(rasa_url=url)
-            ...
-
-    Why host-process, not Docker?
-      - Rasa-pro installs cleanly in the same venv as sovereign-agent
-        (both accept Python 3.12); adding Docker would be the second
-        tool we'd ask students to install and troubleshoot.
-      - Students' production deployments will use containers OR host
-        processes. The homework teaches the *protocol* (REST webhook
-        + action server). Process management is orthogonal.
-      - Logs stream directly to stdout/stderr; students see errors
-        immediately, no `docker logs` gymnastics.
+    Host-process (not Docker) because rasa-pro installs in the same venv
+    as sovereign-agent; the homework teaches the *protocol* (REST webhook
+    + action server), and process management is orthogonal.
     """
 
     def __init__(
@@ -247,7 +291,6 @@ class RasaHostLifecycle:
         startup_timeout_s: float = 180.0,
         log_dir: Path | None = None,
     ) -> None:
-        # Default to the homework's rasa_project/ at the repo root
         self.rasa_project_dir = rasa_project_dir or (
             _SOLUTION_EX6.parent.parent.parent / "rasa_project"
         )
@@ -262,7 +305,7 @@ class RasaHostLifecycle:
         print(msg, flush=True)
         if self.log_dir:
             try:
-                (self.log_dir / "rasa_host.log").parent.mkdir(parents=True, exist_ok=True)
+                self.log_dir.mkdir(parents=True, exist_ok=True)
                 with (self.log_dir / "rasa_host.log").open("a", encoding="utf-8") as f:
                     f.write(msg + "\n")
             except OSError:
@@ -275,7 +318,6 @@ class RasaHostLifecycle:
                 "without a license. Set it in your .env, or use the mock "
                 "server (spawn_mock_rasa) as a fallback."
             )
-
         if not self.rasa_project_dir.exists():
             raise RuntimeError(
                 f"rasa_project/ not found at {self.rasa_project_dir}. "
@@ -293,7 +335,6 @@ class RasaHostLifecycle:
             raise RuntimeError(f"rasa train exited {train_rc} — see {self.log_dir}/rasa_train.log")
         self._log("✓ Rasa model trained")
 
-        # Action server first (Rasa talks to it)
         self._log(f"▶ starting action server on :{self.action_port}")
         self._action_proc = self._spawn_bg(
             ["rasa", "run", "actions", "-p", str(self.action_port)],
@@ -301,23 +342,13 @@ class RasaHostLifecycle:
             log_name="rasa_actions.log",
         )
 
-        # Then Rasa server
         self._log(f"▶ starting rasa server on :{self.rasa_port}")
         self._rasa_proc = self._spawn_bg(
-            [
-                "rasa",
-                "run",
-                "--enable-api",
-                "--cors",
-                "*",
-                "-p",
-                str(self.rasa_port),
-            ],
+            ["rasa", "run", "--enable-api", "--cors", "*", "-p", str(self.rasa_port)],
             cwd=self.rasa_project_dir,
             log_name="rasa_server.log",
         )
 
-        # Poll for health
         deadline = time.monotonic() + self.startup_timeout_s
         last_err = "(no probe yet)"
         while time.monotonic() < deadline:
@@ -331,25 +362,21 @@ class RasaHostLifecycle:
                         return f"http://localhost:{self.rasa_port}/webhooks/rest/webhook"
             except (URLError, HTTPError) as e:
                 last_err = str(e)
-                # Also check if either subprocess died
                 if self._rasa_proc and self._rasa_proc.poll() is not None:
                     self._log(
-                        f"✗ rasa server died with rc={self._rasa_proc.returncode} "
+                        f"✗ rasa server died rc={self._rasa_proc.returncode} "
                         f"— see {self.log_dir}/rasa_server.log"
                     )
                     break
                 if self._action_proc and self._action_proc.poll() is not None:
                     self._log(
-                        f"✗ action server died with rc={self._action_proc.returncode} "
+                        f"✗ action server died rc={self._action_proc.returncode} "
                         f"— see {self.log_dir}/rasa_actions.log"
                     )
                     break
             await asyncio.sleep(2)
 
-        # Health timeout / server died
-        self._log(
-            f"✗ Rasa did not become healthy after {self.startup_timeout_s}s. Last error: {last_err}"
-        )
+        self._log(f"✗ Rasa not healthy after {self.startup_timeout_s}s. Last error: {last_err}")
         raise TimeoutError(f"Rasa not healthy after {self.startup_timeout_s}s")
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
@@ -369,12 +396,10 @@ class RasaHostLifecycle:
                 self._log(f"  {name} teardown failed: {e}")
 
     def _spawn_bg(self, cmd: list[str], cwd: Path, log_name: str) -> subprocess.Popen:
-        """Spawn a background process; stream its stdout+stderr into a log file."""
         self._log(f"  $ {' '.join(cmd)}  (cwd={cwd})")
         if self.log_dir:
             self.log_dir.mkdir(parents=True, exist_ok=True)
-            log_path = self.log_dir / log_name
-            fh = log_path.open("w", encoding="utf-8")
+            fh = (self.log_dir / log_name).open("w", encoding="utf-8")
         else:
             fh = subprocess.DEVNULL
         try:
@@ -383,7 +408,7 @@ class RasaHostLifecycle:
                 cwd=str(cwd),
                 stdout=fh,
                 stderr=subprocess.STDOUT,
-                env={**os.environ},  # inherit RASA_PRO_LICENSE, NEBIUS_KEY, etc.
+                env={**os.environ},
             )
         except FileNotFoundError as e:
             raise RuntimeError(
@@ -392,12 +417,10 @@ class RasaHostLifecycle:
             ) from e
 
     def _run_sync(self, cmd: list[str], *, cwd: Path, timeout: int, log_name: str) -> int:
-        """Run a command synchronously; stream output to log file."""
         self._log(f"  $ {' '.join(cmd)}  (cwd={cwd})")
         if self.log_dir:
             self.log_dir.mkdir(parents=True, exist_ok=True)
-            log_path = self.log_dir / log_name
-            with log_path.open("w", encoding="utf-8") as fh:
+            with (self.log_dir / log_name).open("w", encoding="utf-8") as fh:
                 try:
                     proc = subprocess.run(
                         cmd,
@@ -411,20 +434,17 @@ class RasaHostLifecycle:
                 except subprocess.TimeoutExpired:
                     self._log(f"  ✗ {cmd[0]} timed out after {timeout}s")
                     return 124
-        else:
-            proc = subprocess.run(cmd, cwd=str(cwd), timeout=timeout)
-            return proc.returncode
+        proc = subprocess.run(cmd, cwd=str(cwd), timeout=timeout)
+        return proc.returncode
 
 
 # ─────────────────────────────────────────────────────────────────────
 # Stdlib mock server (used when no Rasa license)
 # ─────────────────────────────────────────────────────────────────────
-
-
 class _MockRasaHandler(BaseHTTPRequestHandler):
-    """Stdlib mock of Rasa's REST webhook. Same party/deposit rules
-    as real ActionValidateBooking so the two paths give identical
-    answers for a given input."""
+    """Stdlib mock of Rasa's REST webhook. Same party/deposit rules as
+    ActionValidateBooking so both paths agree for a given input. Also
+    mirrors /request_research so the research path is testable offline."""
 
     def log_message(self, fmt, *args):  # noqa: N802
         return
@@ -437,7 +457,18 @@ class _MockRasaHandler(BaseHTTPRequestHandler):
         except Exception:  # noqa: BLE001
             payload = {}
 
+        message = payload.get("message", "")
         booking = payload.get("metadata", {}).get("booking", {})
+
+        if message == "/request_research":
+            response = [
+                {
+                    "text": "Researching another venue.",
+                    "custom": {"action": "request_research", "reason": "exceeds_cap"},
+                }
+            ]
+            return self._send(response)
+
         party = booking.get("party_size")
         deposit = booking.get("deposit_gbp", 0)
 
@@ -466,7 +497,8 @@ class _MockRasaHandler(BaseHTTPRequestHandler):
             ref = (
                 "BK-"
                 + hashlib.sha1(
-                    f"{booking.get('venue_id')}|{booking.get('date')}|{booking.get('time')}|{party}".encode()
+                    f"{booking.get('venue_id')}|{booking.get('date')}|"
+                    f"{booking.get('time')}|{party}".encode()
                 )
                 .hexdigest()[:8]
                 .upper()
@@ -477,14 +509,18 @@ class _MockRasaHandler(BaseHTTPRequestHandler):
                     "custom": {"action": "committed", "booking_reference": ref},
                 }
             ]
+        self._send(response)
 
+    def _send(self, response: list) -> None:
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
         self.wfile.write(json.dumps(response).encode("utf-8"))
 
 
-def spawn_mock_rasa(port: int = 5905) -> tuple[ThreadingHTTPServer, threading.Thread, str]:
+def spawn_mock_rasa(
+    port: int = 5905,
+) -> tuple[ThreadingHTTPServer, threading.Thread, str]:
     server = ThreadingHTTPServer(("127.0.0.1", port), _MockRasaHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()

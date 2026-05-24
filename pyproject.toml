@@ -13,6 +13,7 @@ dependencies = [
   "sovereign-agent == 0.2.0",
   "python-dotenv >= 1.0.0",
   "pyyaml >= 6.0",
+  "setuptools>=80.10.2",
 ]
 
 [project.optional-dependencies]

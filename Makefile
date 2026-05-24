@@ -306,6 +306,10 @@ ex6-help: ## Print the three-terminal recipe for Ex6 real mode
 ex7: ## Run Ex7 (handoff bridge) end-to-end
 	@$(UV) run python -m starter.handoff_bridge.run
 
+.PHONY: ex7-real
+ex7-real: ## Run Ex7 (handoff bridge) end-to-end
+	@$(UV) run python -m starter.handoff_bridge.run --real 
+
 .PHONY: ex8-text
 ex8-text: ## Run Ex8 (voice pipeline) in TEXT-ONLY mode — no Speechmatics needed
 	@$(UV) run python -m starter.voice_pipeline.run --text

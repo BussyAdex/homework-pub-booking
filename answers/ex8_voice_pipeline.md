@@ -2,6 +2,7 @@
 
 ## Your answer
 
+
 The voice pipeline has two modes with shared trace-event contract:
 text mode (run_text_mode, shipped complete) reads stdin and the
 manager persona replies via Llama-3.3-70B; voice mode (run_voice_mode,
